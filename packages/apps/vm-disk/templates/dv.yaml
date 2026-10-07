@@ -22,10 +22,90 @@
            this release's upgrades. */}}
     {{- if not $existingDV }}
       {{- $golden := lookup "cdi.kubevirt.io/v1beta1" "DataVolume" "cozy-public" $desiredSource.pvc.name }}
+      {{- $goldenPVC := lookup "v1" "PersistentVolumeClaim" "cozy-public" $desiredSource.pvc.name }}
       {{- if eq (dig "status" "phase" "" $golden | toString) "Failed" }}
         {{- fail (printf "source.image %q: golden DataVolume %q in cozy-public failed to import (phase Failed), so a clone of it would never complete. Ask the platform administrator to check the importer pod in cozy-public, then delete that DataVolume to retry the import." .Values.source.image.name $desiredSource.pvc.name) }}
-      {{- else if and (not $golden) (not (lookup "v1" "PersistentVolumeClaim" "cozy-public" $desiredSource.pvc.name)) (lookup "v1" "Namespace" "" .Release.Namespace) }}
+      {{- else if and (not $golden) (not $goldenPVC) (lookup "v1" "Namespace" "" .Release.Namespace) }}
         {{- fail (printf "source.image %q: golden image %q not found in cozy-public, so a clone of it would never start. Check the image name, or ask the platform administrator to add cozystack.vm-default-images to bundles.enabledPackages." .Values.source.image.name $desiredSource.pvc.name) }}
+      {{- end }}
+      {{- /* Refuse a clone into a class other than the golden's that CDI would
+             attempt as an advanced clone (csi-clone, or snapshot with a usable
+             snapshot class): nothing on that path compares class names,
+             so a target class of the same provisioner gets no fallback, and on
+             a class that cannot place the volume next to the source data the
+             clone PVC never binds. No class attribute tells such a class apart,
+             so every one is refused. The golden PVC carries the class CDI
+             resolved for it; without one (no cluster, or the PVC not created
+             yet) nothing is compared. An empty storageClass is resolved the
+             way CDI resolves it for a kubevirt DataVolume: the default virt
+             class, else the Kubernetes default class. CDI breaks a tie between
+             several defaults by creation time; that is not reproduced, so a
+             tie compares nothing. */}}
+      {{- $goldenSC := dig "spec" "storageClassName" "" ($goldenPVC | default dict) | toString }}
+      {{- $targetSC := $requestedSC }}
+      {{- if and $goldenSC (not $targetSC) }}
+        {{- $classes := (lookup "storage.k8s.io/v1" "StorageClass" "" "").items | default list }}
+        {{- $resolved := false }}
+        {{- range $annotation := list "storageclass.kubevirt.io/is-default-virt-class" "storageclass.kubernetes.io/is-default-class" }}
+          {{- if not $resolved }}
+            {{- $defaults := list }}
+            {{- range $classes }}
+              {{- if eq (dig "metadata" "annotations" $annotation "" . | toString) "true" }}
+                {{- $defaults = append $defaults .metadata.name }}
+              {{- end }}
+            {{- end }}
+            {{- if $defaults }}
+              {{- $resolved = true }}
+              {{- if eq (len $defaults) 1 }}{{- $targetSC = first $defaults }}{{- end }}
+            {{- end }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- if and $goldenSC $targetSC (ne $goldenSC $targetSC) }}
+        {{- /* Mirror CDI's planner (pkg/controller/clone/planner.go at
+               v1.66.1): the strategy is the CDI CR's override, else the target
+               StorageProfile's, else snapshot. snapshot falls back to a
+               host-assisted copy when no VolumeSnapshotClass serves the
+               provisioner (the one both StorageProfiles name, else any), and
+               otherwise goes on like csi-clone. csi-clone falls back on a
+               provisioner or volume mode mismatch, or on a larger target in a
+               class without expansion; sizes are not compared, so a class
+               without expansion is left alone. A host-assisted copy completes,
+               so every fallback renders. Anything not found compares nothing. */}}
+        {{- $cdi := lookup "cdi.kubevirt.io/v1beta1" "CDI" "" "cdi" }}
+        {{- $profile := lookup "cdi.kubevirt.io/v1beta1" "StorageProfile" "" $targetSC | default dict }}
+        {{- $goldenClass := lookup "storage.k8s.io/v1" "StorageClass" "" $goldenSC | default dict }}
+        {{- $targetClass := lookup "storage.k8s.io/v1" "StorageClass" "" $targetSC | default dict }}
+        {{- $strategy := "" }}
+        {{- if $cdi }}
+          {{- $strategy = dig "spec" "cloneStrategyOverride" "" $cdi | default (dig "status" "cloneStrategy" "snapshot" $profile) | toString }}
+        {{- end }}
+        {{- $goldenProvisioner := dig "provisioner" "" $goldenClass | toString }}
+        {{- $advanced := eq $strategy "csi-clone" }}
+        {{- /* Gated on the API being served: a lookup of a kind the cluster
+               does not know fails the render instead of returning nothing. */}}
+        {{- if and (eq $strategy "snapshot") (.Capabilities.APIVersions.Has "snapshot.storage.k8s.io/v1/VolumeSnapshotClass") }}
+          {{- $goldenProfile := lookup "cdi.kubevirt.io/v1beta1" "StorageProfile" "" $goldenSC | default dict }}
+          {{- $commonSnapshotClass := dig "status" "snapshotClass" "" $goldenProfile | toString }}
+          {{- if ne $commonSnapshotClass (dig "status" "snapshotClass" "" $profile | toString) }}
+            {{- $commonSnapshotClass = "" }}
+          {{- end }}
+          {{- if $commonSnapshotClass }}
+            {{- $advanced = eq (dig "driver" "" (lookup "snapshot.storage.k8s.io/v1" "VolumeSnapshotClass" "" $commonSnapshotClass | default dict) | toString) $goldenProvisioner }}
+          {{- else }}
+            {{- range (lookup "snapshot.storage.k8s.io/v1" "VolumeSnapshotClass" "" "").items | default list }}
+              {{- if eq (dig "driver" "" . | toString) $goldenProvisioner }}{{- $advanced = true }}{{- end }}
+            {{- end }}
+          {{- end }}
+        {{- end }}
+        {{- $propertySets := dig "status" "claimPropertySets" list $profile }}
+        {{- $targetMode := "" }}
+        {{- if $propertySets }}
+          {{- $targetMode = dig "volumeMode" "Filesystem" (first $propertySets) | toString }}
+        {{- end }}
+        {{- if and $advanced (eq $goldenProvisioner (dig "provisioner" "" $targetClass | toString)) (eq $targetMode (dig "spec" "volumeMode" "Filesystem" $goldenPVC | toString)) (dig "allowVolumeExpansion" false $targetClass) }}
+          {{- fail (printf "source.image %q: golden image %q lives in StorageClass %q, and a clone into StorageClass %q of the same provisioner gets no host-assisted fallback from CDI and may never bind. Set storageClass to %q, or ask the platform administrator to set cloneStrategyOverride to copy in the kubevirt-cdi package." .Values.source.image.name $desiredSource.pvc.name $goldenSC $targetSC $goldenSC) }}
+        {{- end }}
       {{- end }}
     {{- end }}
   {{- else if hasKey .Values.source "http" }}
