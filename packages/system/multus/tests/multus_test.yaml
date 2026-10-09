@@ -35,13 +35,49 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[?(@.name=="kube-multus")].resources.limits.memory
-          value: 1Gi
+          value: 4Gi
       - equal:
           path: spec.template.spec.containers[?(@.name=="kube-multus")].resources.requests.memory
           value: 100Mi
       - equal:
           path: spec.template.spec.initContainers[?(@.name=="install-multus-binary")].resources.limits.memory
           value: 128Mi
+
+  # Every pod sandbox on the node goes through kube-multus, so a CPU limit
+  # throttles the whole node's CNI queue: after a CNI outage the backlog
+  # outgrows kubelet's retry interval and never drains.
+  - it: kube-multus has a CPU request but no CPU limit
+    template: templates/multus-daemonset-thick.yml
+    documentSelector:
+      path: kind
+      value: DaemonSet
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="kube-multus")].resources.requests.cpu
+          value: 100m
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="kube-multus")].resources.limits.cpu
+
+  - it: kube-multus resources are overridable from values
+    template: templates/multus-daemonset-thick.yml
+    documentSelector:
+      path: kind
+      value: DaemonSet
+    set:
+      resources:
+        limits:
+          cpu: "2"
+          memory: 8Gi
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="kube-multus")].resources
+          value:
+            requests:
+              cpu: 100m
+              memory: 100Mi
+            limits:
+              cpu: "2"
+              memory: 8Gi
 
   # Guards the cozystack CNI-ordering fix (multusMasterCNI pinned to the cilium
   # conflist) so multus does not auto-detect kube-ovn ahead of cilium at node
