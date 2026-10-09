@@ -184,3 +184,36 @@ step_block() {
     false
   fi
 }
+
+@test "deletes use the workflow token and skip packages linked elsewhere" {
+  # The app token lists versions but cannot delete them; GITHUB_TOKEN deleted a
+  # version of a package linked to this repository. A package linked elsewhere
+  # is not attempted, so it cannot turn every apply run red: it is skipped with
+  # a warning before its versions are read, while a failed linkage read still
+  # fails the run.
+  block="$(step_block 'Prune' "$RETENTION")"
+  [ -n "$block" ]
+  code="$(printf '%s\n' "$block" | code_lines)"
+
+  printf '%s\n' "$block" | grep -qF 'DELETE_TOKEN: ${{ secrets.GITHUB_TOKEN }}'
+
+  link_at="$(printf '%s\n' "$code" | grep -nF '/packages/container/${enc}" --jq' | awk -F: 'NR == 1 { print $1 }')"
+  read_at="$(printf '%s\n' "$code" | grep -nF '/versions" 2>' | awk -F: 'NR == 1 { print $1 }')"
+  [ -n "$link_at" ] && [ -n "$read_at" ]
+  [ "$link_at" -lt "$read_at" ]
+  window="$(printf '%s\n' "$code" | awk -v s="$link_at" -v e="$read_at" 'NR >= s && NR < e')"
+  printf '%s\n' "$window" | grep -qF '.repository.full_name'
+  printf '%s\n' "$window" | grep -qF 'sweep_failed=1'
+  printf '%s\n' "$window" | grep -qF '!= "$GITHUB_REPOSITORY"'
+  printf '%s\n' "$window" | grep -qF 'unlinked='
+  [ "$(printf '%s\n' "$window" | grep -cF 'continue')" -ge 2 ]
+  if printf '%s\n' "$window" | grep -qF 'retention-delete.sh'; then
+    echo "FAIL: a delete is reachable before the linkage check"
+    false
+  fi
+
+  warn_at="$(printf '%s\n' "$code" | grep -nF 'not linked to' | awk -F: 'NR == 1 { print $1 }')"
+  promotion_at="$(printf '%s\n' "$code" | grep -nF 'promotion_ids=' | awk -F: 'NR == 1 { print $1 }')"
+  [ -n "$warn_at" ] && [ "$warn_at" -lt "$promotion_at" ]
+  printf '%s\n' "$code" | sed -n "${warn_at}p" | grep -qF '::warning::'
+}
